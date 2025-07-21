@@ -8,20 +8,29 @@ import {
   flexRender,
   getCoreRowModel,
   getSortedRowModel,
+  OnChangeFn,
   Row,
-  Table,
+  SortingState,
   useReactTable,
 } from '@tanstack/react-table'
 import {
-  useVirtualizer,
-  VirtualItem,
-  Virtualizer,
-} from '@tanstack/react-virtual'
-import { makeData, Person } from './makeData'
+  keepPreviousData,
+  QueryClient,
+  QueryClientProvider,
+  useInfiniteQuery,
+} from '@tanstack/react-query'
+import { useVirtualizer } from '@tanstack/react-virtual'
 
-//This is a dynamic row height example, which is more complicated, but allows for a more realistic table.
-//See https://tanstack.com/virtual/v3/docs/examples/react/table for a simpler fixed row height example.
+import { fetchData, Person, PersonApiResponse } from './makeData'
+
+const fetchSize = 500
+
 function App() {
+  //we need a reference to the scrolling element for logic down below
+  const tableContainerRef = React.useRef<HTMLDivElement>(null)
+
+  const [sorting, setSorting] = React.useState<SortingState>([])
+
   const columns = React.useMemo<ColumnDef<Person>[]>(
     () => [
       {
@@ -62,41 +71,117 @@ function App() {
         accessorKey: 'createdAt',
         header: 'Created At',
         cell: info => info.getValue<Date>().toLocaleString(),
-        size: 250,
+        size: 200,
       },
     ],
     []
   )
 
-  // The virtualizer will need a reference to the scrollable container element
-  const tableContainerRef = React.useRef<HTMLDivElement>(null)
+  //react-query has a useInfiniteQuery hook that is perfect for this use case
+  const { data, fetchNextPage, isFetching, isLoading } =
+    useInfiniteQuery<PersonApiResponse>({
+      queryKey: [
+        'people',
+        sorting, //refetch when sorting changes
+      ],
+      queryFn: async ({ pageParam = 0 }) => {
+        const start = (pageParam as number) * fetchSize
+        const fetchedData = await fetchData(start, fetchSize, sorting) //pretend api call
+        return fetchedData
+      },
+      initialPageParam: 0,
+      getNextPageParam: (_lastGroup, groups) => groups.length,
+      refetchOnWindowFocus: false,
+      placeholderData: keepPreviousData,
+    })
 
-  const [data, setData] = React.useState(() => makeData(1_300_000))
+  //flatten the array of arrays from the useInfiniteQuery hook
+  const flatData = React.useMemo(
+    () => data?.pages?.flatMap(page => page.data) ?? [],
+    [data]
+  )
+  const totalDBRowCount = data?.pages?.[0]?.meta?.totalRowCount ?? 0
+  const totalFetched = flatData.length
 
-  const refreshData = React.useCallback(() => {
-    setData(makeData(1_000_000))
-  }, [])
+  //called on scroll and possibly on mount to fetch more data as the user scrolls and reaches bottom of table
+  const fetchMoreOnBottomReached = React.useCallback(
+    (containerRefElement?: HTMLDivElement | null) => {
+      if (containerRefElement) {
+        const { scrollHeight, scrollTop, clientHeight } = containerRefElement
+        //once the user has scrolled within 500px of the bottom of the table, fetch more data if we can
+        if (
+          scrollHeight - scrollTop - clientHeight < 500 &&
+          !isFetching &&
+          totalFetched < totalDBRowCount
+        ) {
+          fetchNextPage()
+        }
+      }
+    },
+    [fetchNextPage, isFetching, totalFetched, totalDBRowCount]
+  )
+
+  //a check on mount and after a fetch to see if the table is already scrolled to the bottom and immediately needs to fetch more data
+  React.useEffect(() => {
+    fetchMoreOnBottomReached(tableContainerRef.current)
+  }, [fetchMoreOnBottomReached])
 
   const table = useReactTable({
-    data,
+    data: flatData,
     columns,
+    state: {
+      sorting,
+    },
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
+    manualSorting: true,
     debugTable: true,
   })
 
-  // All important CSS styles are included as inline styles for this example. This is not recommended for your code.
+  //scroll to top of table when sorting changes
+  const handleSortingChange: OnChangeFn<SortingState> = updater => {
+    setSorting(updater)
+    if (!!table.getRowModel().rows.length) {
+      rowVirtualizer.scrollToIndex?.(0)
+    }
+  }
+
+  //since this table option is derived from table row model state, we're using the table.setOptions utility
+  table.setOptions(prev => ({
+    ...prev,
+    onSortingChange: handleSortingChange,
+  }))
+
+  const { rows } = table.getRowModel()
+
+  const rowVirtualizer = useVirtualizer({
+    count: rows.length,
+    estimateSize: () => 33, //estimate row height for accurate scrollbar dragging
+    getScrollElement: () => tableContainerRef.current,
+    //measure dynamic row height, except in firefox because it measures table border height incorrectly
+    measureElement:
+      typeof window !== 'undefined' &&
+      navigator.userAgent.indexOf('Firefox') === -1
+        ? element => element?.getBoundingClientRect().height
+        : undefined,
+    overscan: 5,
+  })
+
+  if (isLoading) {
+    return <>Loading...</>
+  }
+
   return (
     <div className="app">     
-      ({data.length} rows)
-      <button onClick={refreshData}>Refresh Data</button>
+      ({flatData.length} of {totalDBRowCount} rows fetched)
       <div
         className="container"
+        onScroll={e => fetchMoreOnBottomReached(e.currentTarget)}
         ref={tableContainerRef}
         style={{
           overflow: 'auto', //our scrollable table container
           position: 'relative', //needed for sticky header
-          height: '800px', //should be a fixed height
+          height: '600px', //should be a fixed height
         }}
       >
         {/* Even though we're still using sematic table tags, we must use CSS grid and flexbox for dynamic row heights */}
@@ -146,91 +231,51 @@ function App() {
               </tr>
             ))}
           </thead>
-          <TableBody table={table} tableContainerRef={tableContainerRef} />
-        </table>
-      </div>
-    </div>
-  )
-}
-
-interface TableBodyProps {
-  table: Table<Person>
-  tableContainerRef: React.RefObject<HTMLDivElement>
-}
-
-function TableBody({ table, tableContainerRef }: TableBodyProps) {
-  const { rows } = table.getRowModel()
-
-  // Important: Keep the row virtualizer in the lowest component possible to avoid unnecessary re-renders.
-  const rowVirtualizer = useVirtualizer<HTMLDivElement, HTMLTableRowElement>({
-    count: rows.length,
-    estimateSize: () => 10, //estimate row height for accurate scrollbar dragging
-    getScrollElement: () => tableContainerRef.current,
-    //measure dynamic row height, except in firefox because it measures table border height incorrectly
-    measureElement:
-      typeof window !== 'undefined' &&
-      navigator.userAgent.indexOf('Firefox') === -1
-        ? element => element?.getBoundingClientRect().height
-        : undefined,
-    overscan: 5,
-  })
-
-  return (
-    <tbody
-      style={{
-        display: 'grid',
-        height: `${rowVirtualizer.getTotalSize()}px`, //tells scrollbar how big the table is
-        position: 'relative', //needed for absolute positioning of rows
-      }}
-    >
-      {rowVirtualizer.getVirtualItems().map(virtualRow => {
-        const row = rows[virtualRow.index] as Row<Person>
-        return (
-          <TableBodyRow
-            key={row.id}
-            row={row}
-            virtualRow={virtualRow}
-            rowVirtualizer={rowVirtualizer}
-          />
-        )
-      })}
-    </tbody>
-  )
-}
-
-interface TableBodyRowProps {
-  row: Row<Person>
-  virtualRow: VirtualItem
-  rowVirtualizer: Virtualizer<HTMLDivElement, HTMLTableRowElement>
-}
-
-function TableBodyRow({ row, virtualRow, rowVirtualizer }: TableBodyRowProps) {
-  return (
-    <tr
-      data-index={virtualRow.index} //needed for dynamic row height measurement
-      ref={node => rowVirtualizer.measureElement(node)} //measure dynamic row height
-      key={row.id}
-      style={{
-        display: 'flex',
-        position: 'absolute',
-        transform: `translateY(${virtualRow.start}px)`, //this should always be a `style` as it changes on scroll
-        width: '100%',
-      }}
-    >
-      {row.getVisibleCells().map(cell => {
-        return (
-          <td
-            key={cell.id}
+          <tbody
             style={{
-              display: 'flex',
-              width: cell.column.getSize(),
+              display: 'grid',
+              height: `${rowVirtualizer.getTotalSize()}px`, //tells scrollbar how big the table is
+              position: 'relative', //needed for absolute positioning of rows
             }}
           >
-            {flexRender(cell.column.columnDef.cell, cell.getContext())}
-          </td>
-        )
-      })}
-    </tr>
+            {rowVirtualizer.getVirtualItems().map(virtualRow => {
+              const row = rows[virtualRow.index] as Row<Person>
+              return (
+                <tr
+                  data-index={virtualRow.index} //needed for dynamic row height measurement
+                  ref={node => rowVirtualizer.measureElement(node)} //measure dynamic row height
+                  key={row.id}
+                  style={{
+                    display: 'flex',
+                    position: 'absolute',
+                    transform: `translateY(${virtualRow.start}px)`, //this should always be a `style` as it changes on scroll
+                    width: '100%',
+                  }}
+                >
+                  {row.getVisibleCells().map(cell => {
+                    return (
+                      <td
+                        key={cell.id}
+                        style={{
+                          display: 'flex',
+                          width: cell.column.getSize(),
+                        }}
+                      >
+                        {flexRender(
+                          cell.column.columnDef.cell,
+                          cell.getContext()
+                        )}
+                      </td>
+                    )
+                  })}
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      {isFetching && <div>Fetching More...</div>}
+    </div>
   )
 }
 
@@ -238,8 +283,12 @@ const rootElement = document.getElementById('root')
 
 if (!rootElement) throw new Error('Failed to find the root element')
 
+const queryClient = new QueryClient()
+
 ReactDOM.createRoot(rootElement).render(
   <React.StrictMode>
-    <App />
+    <QueryClientProvider client={queryClient}>
+      <App />
+    </QueryClientProvider>
   </React.StrictMode>
 )
